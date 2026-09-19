@@ -980,6 +980,9 @@ class AI(Tiku):
         super().__init__()
         self.name = 'AI大模型答题'
         self.last_request_time = None
+        self.thinking_enabled = False
+        self.max_tokens = None
+        self.extra_body_json = ''
 
     def _is_deepseek_v4(self) -> bool:
         return (
@@ -988,10 +991,50 @@ class AI(Tiku):
         )
 
     def _completion_kwargs(self, **kwargs):
-        if self._is_deepseek_v4():
-            # DeepSeek V4 defaults to thinking mode, which can leave message.content empty.
-            kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
+        # Thinking 透传（Agnes 等 OpenAI 兼容站）：
+        # openai-python 的 create() 不接受 chat_template_kwargs 顶层参数，
+        # 必须经 extra_body 透传，否则报 TypeError。
+        extra_body = dict(kwargs.get('extra_body') or {})
+        if self.thinking_enabled:
+            extra_body['chat_template_kwargs'] = {'enable_thinking': True}
+        elif self._is_deepseek_v4():
+            # 向后兼容：DeepSeek V4 默认开 thinking 会导致 message.content 为空，
+            # 未显式开启时保持历史行为（关闭）。
+            extra_body.setdefault('thinking', {'type': 'disabled'})
+        if getattr(self, 'extra_body_json', ''):
+            try:
+                custom = json.loads(self.extra_body_json)
+                if isinstance(custom, dict):
+                    extra_body.update(custom)
+                else:
+                    logger.warning('extra_body_json 不是 JSON 对象，已忽略')
+            except Exception as e:
+                logger.warning(f'extra_body_json 解析失败，已忽略: {e}')
+        if extra_body:
+            kwargs['extra_body'] = extra_body
+        # thinking 占用输出 token，不带 max_tokens 易被截断导致无法解析
+        if self.max_tokens and 'max_tokens' not in kwargs:
+            kwargs['max_tokens'] = self.max_tokens
         return kwargs
+
+    @staticmethod
+    def _extract_message_content(message) -> Optional[str]:
+        # 优先 content；thinking 模型可能把内容放在 reasoning_content/reasoning
+        content = getattr(message, 'content', None)
+        if content:
+            return content
+        for attr in ('reasoning_content', 'reasoning'):
+            value = getattr(message, attr, None)
+            if value:
+                return value
+        try:
+            dumped = message.model_dump() if hasattr(message, 'model_dump') else {}
+            for key in ('reasoning_content', 'reasoning'):
+                if dumped.get(key):
+                    return dumped[key]
+        except Exception:
+            pass
+        return None
 
     def _wait_for_interval(self):
         if self.last_request_time:
@@ -1093,7 +1136,10 @@ class AI(Tiku):
             ))
 
         try:
-            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            raw_content = self._extract_message_content(completion.choices[0].message)
+            if not raw_content:
+                raise ValueError('empty message content')
+            response = json.loads(remove_md_json_wrapper(raw_content))
             sep = "\n"
             return sep.join(response['Answer']).strip()
         except:
@@ -1104,8 +1150,16 @@ class AI(Tiku):
         self.endpoint = self._conf['endpoint']
         self.key = self._conf['key']
         self.model = self._conf['model']
-        self.http_proxy = self._conf['http_proxy']
-        self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+        self.http_proxy = self._conf.get('http_proxy', '')
+        self.min_interval_seconds = int(self._conf.get('min_interval_seconds', 3) or 3)
+        thinking_raw = str(self._conf.get('thinking_enabled', 'false')).strip().lower()
+        self.thinking_enabled = thinking_raw in {'1', 'true', 'yes', 'y', 'on'}
+        try:
+            self.max_tokens = int(self._conf.get('max_tokens', 0) or 0) or None
+        except (TypeError, ValueError):
+            logger.warning('max_tokens 配置无效，已忽略')
+            self.max_tokens = None
+        self.extra_body_json = (self._conf.get('extra_body_json', '') or '').strip()
 
     def check_llm_connection(self) -> bool:
         """
@@ -1120,7 +1174,7 @@ class AI(Tiku):
             else:
                 client = OpenAI(base_url=self.endpoint, api_key=self.key)
 
-            # 发送一个简单的测试请求
+            # 发送一个简单的测试请求（thinking 模型需预留输出 token，不能用 64）
             self._wait_for_interval()
             self.last_request_time = time.time()
             completion = client.chat.completions.create(**self._completion_kwargs(
@@ -1131,10 +1185,10 @@ class AI(Tiku):
                         'content': '你好，请回答：1+1 等于几？只回答数字。'
                     }
                 ],
-                max_tokens=64
+                max_tokens=self.max_tokens or 1024
             ))
-            
-            if completion.choices and completion.choices[0].message.content:
+
+            if completion.choices and self._extract_message_content(completion.choices[0].message):
                 logger.info(f'{self.name} 连接检查成功')
                 return True
             else:
